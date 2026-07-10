@@ -1,5 +1,6 @@
 ﻿using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Hosting;
+using NzbWebDAV.Clients.RadarrSonarr.BaseModels;
 using NzbWebDAV.Clients.Usenet;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database;
@@ -251,14 +252,47 @@ public class HealthCheckService : BackgroundService
             // if the unhealthy item is linked within the organized media-library
             // then we must find the corresponding arr instance and trigger a new search.
             var linkType = symlinkOrStrmPath.ToLower().EndsWith("strm") ? "strm-file" : "symlink";
+
+            // If we cannot reach an arr instance we do not know whether it owns this file. Falling
+            // through to the delete below would then remove a file that a merely-unreachable arr is
+            // responsible for. Track that uncertainty and bail out to ActionNeeded instead, while
+            // still giving the remaining instances a chance to claim and repair the file.
+            var anInstanceFailed = false;
+
             foreach (var arrClient in _configManager.GetArrConfig().GetArrClients())
             {
-                var rootFolders = await arrClient.GetRootFolders().ConfigureAwait(false);
-                if (!rootFolders.Any(x => symlinkOrStrmPath.StartsWith(x.Path!))) continue;
+                List<ArrRootFolder> rootFolders;
+                try
+                {
+                    rootFolders = await arrClient.GetRootFolders().ConfigureAwait(false);
+                }
+                catch (Exception e)
+                {
+                    anInstanceFailed = true;
+                    Log.Warning("Health-check repair: could not query root folders from arr instance " +
+                                "{Host}: {Message}", arrClient.Host, e.Message);
+                    continue;
+                }
+
+                // A root folder with no path cannot match anything, and StartsWith(null) throws.
+                if (!rootFolders.Any(x => x.Path is not null && symlinkOrStrmPath.StartsWith(x.Path))) continue;
 
                 // if we found a corresponding arr instance,
                 // then remove and search.
-                if (await arrClient.RemoveAndSearch(symlinkOrStrmPath).ConfigureAwait(false))
+                bool removedAndSearched;
+                try
+                {
+                    removedAndSearched = await arrClient.RemoveAndSearch(symlinkOrStrmPath).ConfigureAwait(false);
+                }
+                catch (Exception e)
+                {
+                    anInstanceFailed = true;
+                    Log.Warning("Health-check repair: remove-and-search failed on arr instance " +
+                                "{Host}: {Message}", arrClient.Host, e.Message);
+                    continue;
+                }
+
+                if (removedAndSearched)
                 {
                     dbClient.Ctx.Items.Remove(davItem);
                     dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult()
@@ -284,6 +318,30 @@ public class HealthCheckService : BackgroundService
                 // we can fall back to the behavior below of deleting both the link-file
                 // and the dav-item.
                 break;
+            }
+
+            // An instance we could not reach may well be the owner of this file. Deleting it now
+            // would destroy a link the arr still tracks, so stop here and let a human (or the next
+            // health-check pass, once the instance is reachable again) decide.
+            if (anInstanceFailed)
+            {
+                dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult()
+                {
+                    Id = Guid.NewGuid(),
+                    DavItemId = davItem.Id,
+                    Path = davItem.Path,
+                    CreatedAt = DateTimeOffset.UtcNow,
+                    Result = HealthCheckResult.HealthResult.Unhealthy,
+                    RepairStatus = HealthCheckResult.RepairAction.ActionNeeded,
+                    Message = string.Join(" ", [
+                        "File had missing articles.",
+                        $"Corresponding {linkType} found within Library Dir,",
+                        "but at least one Arr instance could not be reached, so ownership of the file",
+                        "could not be determined. Leaving the file in place rather than deleting it."
+                    ])
+                }));
+                await dbClient.Ctx.SaveChangesAsync(ct).ConfigureAwait(false);
+                return;
             }
 
             // if we could not find a corresponding arr instance

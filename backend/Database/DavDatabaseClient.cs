@@ -223,16 +223,18 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
         // and rolls back the WHOLE SaveChangesAsync -- so a batch containing one stale id would
         // silently delete none of them (and queue none of their cleanup items). The deleteFiles
         // branch above is already safe because it queries the rows first; this branch was not.
-        var existingIds = await Ctx.HistoryItems
+        // Remove the entities we just loaded rather than fresh stubs. Attaching a stub whose key is
+        // already tracked by this context throws ("another instance with the same key is already
+        // tracked"), and stubs are what made the original code delete rows it had never checked for.
+        var existing = await Ctx.HistoryItems
             .Where(h => ids.Contains(h.Id))
-            .Select(h => h.Id)
             .ToListAsync(ct)
             .ConfigureAwait(false);
 
-        Ctx.HistoryItems.RemoveRange(existingIds.Select(id => new HistoryItem() { Id = id }));
-        Ctx.HistoryCleanupItems.AddRange(existingIds.Select(x => new HistoryCleanupItem
+        Ctx.HistoryItems.RemoveRange(existing);
+        Ctx.HistoryCleanupItems.AddRange(existing.Select(x => new HistoryCleanupItem
         {
-            Id = x,
+            Id = x.Id,
             DeleteMountedFiles = deleteFiles
         }));
     }
