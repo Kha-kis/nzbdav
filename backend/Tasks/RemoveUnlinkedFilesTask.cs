@@ -57,6 +57,23 @@ public class RemoveUnlinkedFilesTask(
         }
         else
         {
+            // The `linkedIdCount < 5` check above only catches a COMPLETELY empty scan. A library
+            // dir that is partially mounted, or pointed at the wrong path, can still expose a
+            // handful of symlinks and sail past it -- and then nearly every webdav item looks
+            // unlinked. Refuse to delete an implausible share of the deletable population.
+            // A healthy library here sits around 31% unlinked (samples, nfos, unimported extras),
+            // so 90% leaves wide headroom while still catching a broken scan.
+            var deletableItems = await CountDeletableItems(startTime);
+            if (deletableItems > 0 && unlinkedItems > deletableItems * 0.9)
+            {
+                Report($"Aborted: {unlinkedItems} of {deletableItems} webdav items appear unlinked " +
+                       $"({100.0 * unlinkedItems / deletableItems:F0}%). That usually means the library " +
+                       $"directory is missing, unmounted, or misconfigured rather than that the items are " +
+                       $"orphaned. Cancelling to prevent accidental bulk deletion. " +
+                       $"Run a dry-run to inspect if this is genuinely expected.");
+                return;
+            }
+
             await RemoveUnlinkedItems(startTime, unlinkedItems);
             await RemoveEmptyDirectories(startTime);
             Report($"Done. Removed {_allRemovedPaths.Count} unlinked files.");
@@ -115,6 +132,28 @@ public class RemoveUnlinkedFilesTask(
         }
 
         Report($"Scanning all linked files...\nFound {count}...");
+    }
+
+    /// <summary>
+    /// The population CountUnlinkedItems draws from: every item this task is allowed to delete,
+    /// linked or not. Must mirror CountUnlinkedItems' predicates exactly (minus the link join),
+    /// otherwise the safety ratio compares two different populations.
+    /// </summary>
+    private async Task<int> CountDeletableItems(DateTime createdBefore)
+    {
+        await using var dbContext = new DavDatabaseContext();
+        var createdBeforeStr = createdBefore.ToString("yyyy-MM-dd HH:mm:ss");
+        var usenetFileType = (int)DavItem.ItemType.UsenetFile;
+
+        return await dbContext.Database
+            .SqlQueryRaw<int>(
+                $"""
+                 SELECT COUNT(i.Id) AS Value FROM DavItems i
+                 WHERE i.Type = {usenetFileType}
+                   AND i.HistoryItemId IS NULL
+                   AND i.CreatedAt < '{createdBeforeStr}'
+                 """)
+            .FirstAsync();
     }
 
     private async Task<int> CountUnlinkedItems(DateTime createdBefore)

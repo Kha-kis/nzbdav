@@ -29,9 +29,19 @@ public class RemoveOrphanedFilesSchedulerService : BackgroundService
 
             var old = Interlocked.Exchange(ref _rescheduleCts, new CancellationTokenSource());
             old.Cancel();
-            old.Dispose();
+            // Deliberately NOT disposed. ExecuteAsync may be between its field read and its
+            // `.Token` access, and CancellationTokenSource.Token throws ObjectDisposedException
+            // once the source is disposed. Cancelling is what wakes the loop; the cancelled
+            // source is then unreferenced and collected. The linked sources ExecuteAsync builds
+            // from it are still disposed by their `using`, so no registration leaks.
         };
     }
+
+    // Sleep in slices rather than one long delay, then re-check the wall clock. A single
+    // `Task.Delay(nextRun - now)` is computed against DateTime.Now, so a DST shift or any clock
+    // adjustment during the wait makes it fire an hour early or late (and can double-run or skip).
+    private static readonly TimeSpan MaxSleepSlice = TimeSpan.FromMinutes(30);
+    private DateTime? _lastLoggedNextRun;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -39,10 +49,15 @@ public class RemoveOrphanedFilesSchedulerService : BackgroundService
         {
             try
             {
+                // Read the source ONCE per iteration. `_rescheduleCts.Token` is a torn read
+                // (load field, then call the property); the config handler can swap the field
+                // in between, and we would take `.Token` from an object we never observed.
+                var reschedule = Volatile.Read(ref _rescheduleCts);
+
                 if (!_configManager.IsRemoveOrphanedFilesScheduleEnabled())
                 {
                     using var disabledLinked = CancellationTokenSource
-                        .CreateLinkedTokenSource(stoppingToken, _rescheduleCts.Token);
+                        .CreateLinkedTokenSource(stoppingToken, reschedule.Token);
                     await Task.Delay(Timeout.Infinite, disabledLinked.Token).ConfigureAwait(false);
                     continue;
                 }
@@ -53,11 +68,21 @@ public class RemoveOrphanedFilesSchedulerService : BackgroundService
                 var nextRun = todayRun > now ? todayRun : todayRun.AddDays(1);
                 var delay = nextRun - now;
 
-                Log.Information("RemoveOrphanedFilesScheduler: next run scheduled at {NextRun}", nextRun);
+                // Only log when the target actually changes; we now wake every slice.
+                if (_lastLoggedNextRun != nextRun)
+                {
+                    Log.Information("RemoveOrphanedFilesScheduler: next run scheduled at {NextRun}", nextRun);
+                    _lastLoggedNextRun = nextRun;
+                }
 
                 using var delayLinked = CancellationTokenSource
-                    .CreateLinkedTokenSource(stoppingToken, _rescheduleCts.Token);
-                await Task.Delay(delay, delayLinked.Token).ConfigureAwait(false);
+                    .CreateLinkedTokenSource(stoppingToken, reschedule.Token);
+                await Task.Delay(delay < MaxSleepSlice ? delay : MaxSleepSlice, delayLinked.Token)
+                    .ConfigureAwait(false);
+
+                // Woke from a slice, not from the scheduled moment. Re-evaluate against the
+                // current wall clock so a DST shift cannot fire us early, twice, or not at all.
+                if (DateTime.Now < nextRun) continue;
 
                 Log.Information("RemoveOrphanedFilesScheduler: running scheduled Remove Orphaned Files task");
                 var task = new RemoveUnlinkedFilesTask(_configManager, _websocketManager, isDryRun: false);
