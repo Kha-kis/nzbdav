@@ -102,6 +102,9 @@ public class NzbFileStream(
     {
         if (!requestedEndByte.HasValue) return null;
         if (fileSegmentIds.Length == 0 || remainingSegmentCount <= 0) return null;
+        // Must precede the Clamp below: Math.Clamp(x, 0, fileSize - 1) throws ArgumentException
+        // when fileSize == 0, because min > max. Reachable for zero-length items.
+        if (fileSize <= 0) return null;
 
         var endByte = Math.Clamp(requestedEndByte.Value, 0, fileSize - 1);
         var avgSegmentSize = (double)fileSize / fileSegmentIds.Length;
@@ -111,7 +114,10 @@ public class NzbFileStream(
             (int)(endByte / avgSegmentSize), 0, fileSegmentIds.Length - 1);
         var withOvershoot = absoluteEndIndex + RangePrefetchOvershootSegments;
         var relativeCount = withOvershoot - firstSegmentIndex + 1;
-        if (relativeCount <= 0) return 0;
+        // Fail OPEN, not closed. Returning 0 would cap the stream at zero segments and serve an
+        // empty body; "no cap" merely forgoes the prefetch saving. Reachable only if the requested
+        // end byte precedes the range start, but a truncated stream is far worse than a full fetch.
+        if (relativeCount <= 0) return null;
         if (relativeCount >= remainingSegmentCount) return null;
         return relativeCount;
     }
